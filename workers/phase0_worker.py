@@ -1,186 +1,225 @@
+from __future__ import annotations
+
 import json
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 
+from sqlalchemy import text
+
+from services.shared.db import get_engine
 from services.shared.logging import trace_logger
-from services.shared.db import exec_sql
+from services.shared.evidence_store import snapshot_evidence
 from services.beliefcore.update_engine import deterministic_update
-from services.evidencevault.snapshot import create_snapshot
-from services.evidencevault.provenance import sign_provenance
-from services.cortexreasoner.explainer import explain
-from services.voiceio.tts_elevenlabs import tts
-
+from services.cortexreasoner.gemini_reasoner import explain
 
 log = logging.getLogger("phase0_worker")
 
 
-def handle_canonical_event(canonical: dict):
-    trace_id = canonical["trace_id"]
-
-    # START TRACE
-    log = trace_logger(trace_id, "phase0_worker")
-    log.info("START")
+def _jsonb(v) -> str:
+    return json.dumps(v, ensure_ascii=False)
 
 
-    event_id = canonical["event_id"]
-    subject = f"service/{canonical.get('normalized', {}).get('service', 'unknown')}"
-    hypothesis = f"Potential incident affecting {subject}"
+def handle_canonical_event(event: dict) -> None:
+    """
+    Phase-0 Canonical Pipeline (STABLE)
 
-    prior = 0.35
-    signal_strength = 0.7 if canonical.get("severity") in ("high", "critical") else 0.4
+    1. Evidence snapshot (Step-7 replay-immune)
+    2. Deterministic belief update
+    3. Belief upsert (WITH evidence_ids)
+    4. Belief delta insert
+    5. Explanation insert
+    6. Audit log append
+    """
 
-    # -------------------------------
-    # Belief Update (Deterministic)
-    # -------------------------------
+    trace_id = event.get("trace_id", "trc_demo")
+    event_id = event.get("event_id", "evt_demo")
+    subject = event.get("subject", "service/api-gateway")
+    hypothesis = event.get(
+        "hypothesis",
+        f"Issue affecting {subject}",
+    )
+
+    trace_logger(trace_id, "phase0_worker", "START")
+
+    # ---------- Step-7: Canonical Evidence Snapshot ----------
+    evidence_id, evidence_sha, signature = snapshot_evidence(
+        trace_id=trace_id,
+        payload=event,
+    )
+
+    # ---------- Deterministic Belief Update ----------
+    prior = float(event.get("prior", 0.35))
+    signal_strength = float(event.get("signal", 0.7))
+
     belief, delta = deterministic_update(
-        subject=subject,
-        trace_id=trace_id,
-        hypothesis=hypothesis,
-        prior=prior,
-        signal_strength=signal_strength,
-        evidence_id=event_id,
+        trace_id,
+        subject,
+        hypothesis,
+        prior,
+        signal_strength,
+        evidence_id,
     )
 
-    # -------------------------------
-    # Evidence Snapshot + Provenance
-    # -------------------------------
-    snap_payload = {
-        "event_id": event_id,
-        "belief": belief.to_dict(),
-        "delta": delta.to_dict(),
-    }
+    now = datetime.now(timezone.utc)
+    engine = get_engine()
 
-    snap = create_snapshot(trace_id=trace_id, payload=snap_payload)
+    with engine.begin() as conn:
 
-    prov = sign_provenance(
-        trace_id=trace_id,
-        evidence_id=snap["evidence_id"],
-        sha256=snap["sha256"],
-        actor="phase0_worker",
-    )
-
-    # -------------------------------
-    # Persist Belief (JSONB FIX)
-    # -------------------------------
-    exec_sql(
-        """
-        INSERT INTO beliefs (
-            belief_id, trace_id, subject, hypothesis,
-            confidence, updated_at, evidence_ids
-        )
-        VALUES (
-            :belief_id, :trace_id, :subject, :hypothesis,
-            :confidence, :updated_at, CAST(:evidence_ids AS jsonb)
-        )
-        ON CONFLICT (belief_id) DO UPDATE
-        SET confidence = EXCLUDED.confidence,
-            updated_at = EXCLUDED.updated_at,
-            evidence_ids = EXCLUDED.evidence_ids
-        """,
-        belief_id=belief.belief_id,
-        trace_id=belief.trace_id,
-        subject=belief.subject,
-        hypothesis=belief.hypothesis,
-        confidence=belief.confidence,
-        updated_at=belief.updated_at.astimezone(timezone.utc),
-        evidence_ids=json.dumps([event_id]),  # ✅ FIXED
-    )
-
-    # -------------------------------
-    # Persist Delta (Idempotent)
-    # -------------------------------
-    exec_sql(
-        """
-        INSERT INTO belief_deltas (
-            belief_id, trace_id, from_conf, to_conf, reason
-        )
-        VALUES (
-            :belief_id, :trace_id, :from_conf, :to_conf, :reason
-        )
-        ON CONFLICT DO NOTHING
-        """,
-        belief_id=delta.belief_id,
-        trace_id=trace_id,
-        from_conf=delta.from_conf,
-        to_conf=delta.to_conf,
-        reason=delta.reason,
-    )
-
-    # -------------------------------
-    # LLM Explanation (Bounded)
-    # -------------------------------
-    expl = explain(
-        belief=belief.to_dict(),
-        evidence=[
-            {"evidence_id": event_id},
-            {"evidence_id": snap["evidence_id"], "sha256": snap["sha256"]},
-        ],
-    )
-
-    # -------------------------------
-    # Voice Output
-    # -------------------------------
-    audio = tts(
-        text=str(expl.get("explanation", "")),
-        confidence=float(belief.confidence),
-    )
-
-    exec_sql(
-        """
-        INSERT INTO explanations (
-            trace_id, belief_id, explanation_json, audio_bytes_len
-        )
-        VALUES (
-            :trace_id, :belief_id, CAST(:explanation_json AS jsonb), :audio_bytes_len
-        )
-        """,
-        trace_id=trace_id,
-        belief_id=belief.belief_id,
-        explanation_json=json.dumps(expl),
-        audio_bytes_len=len(audio),
-    )
-
-    # -------------------------------
-    # Audit Log
-    # -------------------------------
-    exec_sql(
-        """
-        INSERT INTO audit_log (
-            trace_id, actor, action, details
-        )
-        VALUES (
-            :trace_id, :actor, :action, CAST(:details AS jsonb)
-        )
-        """,
-        trace_id=trace_id,
-        actor="phase0_worker",
-        action="belief+evidence+explain",
-        details=json.dumps(
+        # ---------- Belief UPSERT (FIXED) ----------
+        conn.execute(
+            text("""
+                INSERT INTO beliefs (
+                    belief_id,
+                    trace_id,
+                    subject,
+                    hypothesis,
+                    confidence,
+                    evidence_ids,
+                    updated_at
+                )
+                VALUES (
+                    :belief_id,
+                    :trace_id,
+                    :subject,
+                    :hypothesis,
+                    :confidence,
+                    CAST(:evidence_ids AS jsonb),
+                    :updated_at
+                )
+                ON CONFLICT (belief_id) DO UPDATE
+                SET
+                    confidence = EXCLUDED.confidence,
+                    evidence_ids = EXCLUDED.evidence_ids,
+                    updated_at = EXCLUDED.updated_at
+            """),
             {
-                "event_id": event_id,
                 "belief_id": belief.belief_id,
-                "snapshot_id": snap["evidence_id"],
-                "signature": prov["signature"],
-            }
-        ),
-    )
+                "trace_id": trace_id,
+                "subject": subject,
+                "hypothesis": hypothesis,
+                "confidence": float(belief.confidence),
+                "evidence_ids": json.dumps([evidence_id]),
+                "updated_at": now,
+            },
+        )
 
-    log.info("Phase0 complete")
+        # ---------- Belief Delta (Idempotent) ----------
+        conn.execute(
+            text("""
+                INSERT INTO belief_deltas (
+                    belief_id,
+                    trace_id,
+                    from_conf,
+                    to_conf,
+                    reason,
+                    created_at
+                )
+                VALUES (
+                    :belief_id,
+                    :trace_id,
+                    :from_conf,
+                    :to_conf,
+                    :reason,
+                    :created_at
+                )
+                ON CONFLICT DO NOTHING
+            """),
+            {
+                "belief_id": delta.belief_id,
+                "trace_id": trace_id,
+                "from_conf": float(delta.from_conf),
+                "to_conf": float(delta.to_conf),
+                "reason": delta.reason,
+                "created_at": now,
+            },
+        )
+        # 3) Explanation (Phase-0 canon: trace_id + payload only)
+        explanation_payload = {
+            "belief_id": belief.belief_id,
+            "subject": subject,
+            "hypothesis": hypothesis,
+            "confidence": float(belief.confidence),
+            "evidence_ids": [evidence_id],
+        }
+
+        explanation = explain(
+            trace_id,
+            explanation_payload,
+        )
 
 
-def main():
+        conn.execute(
+            text("""
+                INSERT INTO explanations (
+                    belief_id,
+                    trace_id,
+                    explanation_json,
+                    created_at
+                )
+                VALUES (
+                    :belief_id,
+                    :trace_id,
+                    CAST(:explanation_json AS jsonb),
+                    :created_at
+                )
+                ON CONFLICT DO NOTHING
+            """),
+            {
+                "belief_id": belief.belief_id,
+                "trace_id": trace_id,
+                "explanation_json": json.dumps(explanation, ensure_ascii=False),
+                "created_at": now,
+            },
+        )
+
+        # ---------- Audit Log ----------
+        conn.execute(
+            text("""
+                INSERT INTO audit_log (
+                    trace_id,
+                    actor,
+                    action,
+                    details,
+                    created_at
+                )
+                VALUES (
+                    :trace_id,
+                    :actor,
+                    :action,
+                    CAST(:details AS jsonb),
+                    :created_at
+                )
+            """),
+            {
+                "trace_id": trace_id,
+                "actor": "phase0_worker",
+                "action": "phase0_complete",
+                "details": json.dumps(
+                    {
+                        "event_id": event_id,
+                        "belief_id": belief.belief_id,
+                        "evidence_id": evidence_id,
+                        "evidence_sha256": evidence_sha,
+                        "signature": signature,
+                    },
+                    ensure_ascii=False,
+                ),
+                "created_at": now,
+            },
+        )
+
+    log.info("Phase-0 pipeline completed")
+
+
+def main() -> None:
     fixture = {
-        "event_id": "evt_demo",
         "trace_id": "trc_demo",
-        "source": "datadog",
-        "event_type": "alert",
-        "occurred_at": "2025-12-31T13:31:00Z",
-        "severity": "high",
-        "normalized": {
-            "service": "api-gateway",
-            "region": "europe-west2",
-            "message": "Latency spike",
-        },
+        "event_id": "evt_demo",
+        "subject": "service/api-gateway",
+        "hypothesis": "Issue affecting service/api-gateway",
+        "prior": 0.35,
+        "signal": 0.7,
+        "raw": {},
     }
 
     handle_canonical_event(fixture)
