@@ -1,272 +1,213 @@
 # VoxCortex
 
-Real-time cognitive voice intelligence with deterministic belief tracking, semantic idempotency, and full auditability.
+Real-time cognitive voice intelligence with deterministic belief tracking, semantic idempotency, and audit-safe execution.
 
 ---
 
 ## System Intent
 
-VoxCortex is designed as a deterministic cognitive spine that converts raw events into:
+VoxCortex is a deterministic cognitive backend designed to convert raw events into:
 
 - immutable evidence
 - stable beliefs
 - causal belief deltas
-- bounded explanations
-- full forensic audit trails
+- bounded, human-readable explanations
+- reproducible audit trails
 
-The system is replay-safe, idempotent, and auditable by construction.
+The system is built to be replay-safe and idempotent by construction.
 
-This repository captures the Phase-0 canonical pipeline and Phase-1 semantic hardening, as implemented and locked.
-
----
-
-## Canonical Build Status
-
-As of: 01/01/2026 15:27  
-State: Stable, replay-safe, non-drifting
-
-| Component            | Status |
-|---------------------|--------|
-| Phase-0 Worker      | OK     |
-| Evidence Snapshots  | OK     |
-| Beliefs             | OK     |
-| Belief Deltas       | OK     |
-| Explanations        | OK     |
-| Audit Log           | OK     |
-| Replays             | OK     |
+This repository reflects the **actual implemented code**, not future design.
 
 ---
 
-## PHASE-0 - Canonical Ingestion and Ground Truth Spine
+## Repository Scope (Truth-Bound)
 
-Purpose:  
-Create a deterministic, replay-safe, auditable pipeline from raw events to belief to explanation.
+This repository contains:
 
----
+- a single canonical execution worker
+- deterministic belief update logic
+- bounded LLM reasoning
+- evidence provenance handling
+- shared infrastructure utilities
 
-### 1. Canonical Event Handling
-
-File:
-workers/phase0_worker.py
-
-What exists:
-- Single entry point: handle_canonical_event(fixture)
-- Fixed trace_id (trc_demo) for repeatability
-- Deterministic execution order:
-  1. Evidence snapshot
-  2. Belief create or update
-  3. Belief delta
-  4. Explanation generation
-  5. Audit log write
-
-Key properties:
-- Re-runnable
-- No side effects outside database
-- Safe under retries
-
----
-
-### 2. Evidence Snapshot and Provenance
-
-Tables:
-- evidence_snapshots
-- evidence_provenance
-
-Enforced behavior:
-- Every event hashed using SHA256
-- Evidence content is immutable
-- Actor and signature stored per snapshot
-
-Why it matters:
-- Evidence is cryptographically anchored
-- Hash is the root of trust for downstream logic
-
----
-
-### 3. Belief Record (Ground Truth)
-
-Table:
-- beliefs
-
-Semantic identity:
-- (trace_id, subject, hypothesis) defines uniqueness
-
-Behavior:
-- Deterministic confidence updates
-- Evidence IDs stored as JSONB
-- INSERT ... ON CONFLICT DO UPDATE
-
-Guarantee:
-- No duplicate beliefs survive cleanup
-
----
-
-### 4. Deterministic Belief Update Engine
-
-File:
-services/beliefcore/update_engine.py
-
-Logic:
-- _deterministic_update(prior, signal)
-- No randomness
-- Same input always produces same output
-
-Produces:
-- Updated belief
-- Corresponding belief delta
-
----
-
-### 5. Belief Delta (Causality Trail)
-
-Table:
-- belief_deltas
-
-Captured:
-- from_conf to to_conf
-- Reason string (example: deterministic_update(prior=0.35, signal=0.7))
-- Timestamped causal chain
-
----
-
-### 6. Explanation Generation (LLM-Bounded)
-
-File:
-services/cortexreasoner/gemini_reasoner.py
-
-Behavior:
-- Gemini call is bounded
-- Deterministic stub if API key is missing
-- Output stored verbatim
-
-Table:
-- explanations
-
-Safety property:
-- Explanations never feed back into belief math
-- Human-readable only
-
----
-
-### 7. Audit Log (Compliance Spine)
-
-Table:
-- audit_log
-
-Recorded:
-- actor
-- action
-- snapshot_id
-- belief_id
-- timestamp
-
-Guarantee:
-- Full forensic trace from event to belief to explanation
-
----
-
-## PHASE-1 - Semantic Idempotency Hardening
-
-Purpose:  
-Prevent logical duplication even under correct replay.
-
----
-
-### Step-1 - Belief Deduplication
-
-Action:
-- SQL cleanup of duplicate beliefs per (trace_id, subject)
-- Retained newest updated_at
-
-Result:
-- Exactly one active belief per semantic subject
-
----
-
-### Step-2 - Belief Delta Deduplication
-
-Action:
-- Removed duplicate deltas per belief
-- Kept latest causal transition
-
-Result:
-- Delta table expresses true belief evolution
-
----
-
-### Step-3 - Strict Semantic Idempotency
-
-Database script:
-- step6_semantic_idempotency.sql
-
-Constraint:
-- UNIQUE (belief_id, from_conf, to_conf, reason)
-
-Guarantee:
-- Same update cannot be recorded twice
-
----
-
-### Step-4 - Time-Windowed Delta Idempotency (Option B)
-
-Database script:
-- step6b_time_window_idempotency.sql
-
-Added:
-- window_bucket (60 seconds)
-
-Why:
-- Allows controlled re-evaluation
-- Blocks rapid replay storms
-
----
-
-### Step-5 - Update Engine Alignment
-
-Changes:
-- Unified deterministic update path
-- Removed mismatched function signatures
-- Explicit call to _deterministic_update
-
-Outcome:
-- Worker and engine contract is stable
-
----
-
-### Step-6 - Logging Contract Stabilization
-
-File:
-services/shared/logging.py
-
-Fixed:
-- trace_logger signature
-- Missing trace_id formatter errors
-- Safe logging across Gemini and HTTPX
-
-Result:
-- Clean logs
-- No runtime logging failures
+No UI, streaming fan-out, or orchestration layer is included.
 
 ---
 
 ## Repository Structure
 
-apps/      - Admin and API surfaces  
-infra/     - SQL and infrastructure  
+apps/      - Admin/API surface  
+infra/     - SQL initialization  
 services/  - Cognitive core services  
-workers/   - Canonical execution workers  
+workers/   - Canonical execution worker  
 
 ---
 
-## Current Scope Boundary
+## PHASE-0 - Canonical Ingestion and Belief Formation
+
+Purpose:  
+Provide a deterministic, replay-safe pipeline from event ingestion to belief creation.
+
+---
+
+### Canonical Worker
+
+File:
+workers/phase0_worker.py
+
+What it does:
+- Acts as the single entry point for canonical events
+- Executes logic in a fixed order:
+  1. Evidence snapshot
+  2. Belief creation or update
+  3. Belief delta calculation
+  4. Explanation generation
+  5. Audit logging
+
+Properties:
+- Deterministic execution
+- Safe to re-run
+- No side effects outside the database layer
+
+---
+
+### Evidence Handling
+
+Files:
+services/evidencevault/snapshot.py  
+services/evidencevault/provenance.py  
+
+Behavior:
+- Incoming event data is hashed (SHA256)
+- Evidence records are immutable once written
+- Provenance information is stored alongside each snapshot
+
+Purpose:
+- Create a cryptographic and forensic anchor for all downstream logic
+
+---
+
+### Belief Model and Update Engine
+
+Files:
+services/beliefcore/models.py  
+services/beliefcore/update_engine.py  
+
+Behavior:
+- Beliefs are identified by semantic keys (trace, subject, hypothesis)
+- Confidence updates are deterministic
+- Same input always produces the same output
+- No randomness or time-based drift
+
+The update engine produces:
+- an updated belief state
+- a corresponding belief delta
+
+---
+
+### Belief Delta Tracking
+
+Belief deltas represent:
+- prior confidence
+- updated confidence
+- the reason for the transition
+
+Deltas form a causal chain that explains how a belief evolved over time.
+
+---
+
+### Explanation Generation (Bounded)
+
+Files:
+services/cortexreasoner/gemini_reasoner.py  
+services/cortexreasoner/explainer.py  
+
+Behavior:
+- Uses a bounded Gemini call for explanation generation
+- Falls back to a deterministic stub if no API key is present
+- Explanation output never feeds back into belief math
+
+Purpose:
+- Human interpretability only
+- No influence on ground truth
+
+---
+
+### Shared Infrastructure
+
+Files:
+services/shared/config.py  
+services/shared/db.py  
+services/shared/logging.py  
+services/shared/crypto.py  
+services/shared/ids.py  
+
+Purpose:
+- Configuration loading
+- Database access
+- Trace-safe logging
+- ID and hash utilities
+
+Logging is stabilized to ensure:
+- consistent trace IDs
+- no runtime formatter failures
+- safe interaction with HTTP and LLM clients
+
+---
+
+## PHASE-1 - Semantic Idempotency Hardening (Logical)
+
+Purpose:  
+Prevent logical duplication during correct replays.
+
+This phase is implemented as **logic and constraints inside existing code**, not as separate migration files.
+
+Guarantees:
+- A belief is not duplicated for the same semantic identity
+- Replayed events do not create duplicate belief deltas
+- Deterministic update paths are enforced consistently
+
+---
+
+## Admin and Signal Interfaces
+
+Files:
+apps/adminconsole/api.py  
+services/signalmesh/app.py  
+services/signalmesh/normalizer.py  
+services/signalmesh/schemas.py  
+
+Purpose:
+- Provide normalized signal ingestion
+- Define schemas for structured input
+- Prepare future integration points
+
+These components do not alter belief math.
+
+---
+
+## Database Initialization
+
+File:
+infra/sql/001_init.sql  
+
+Purpose:
+- Initial schema setup
+- Baseline tables required by the system
+
+No other migrations are included in this repository.
+
+---
+
+## Current Boundary
 
 This repository intentionally stops at:
 - deterministic ingestion
 - belief math
-- idempotency
-- auditability
+- semantic idempotency
+- audit safety
 
-No UI, orchestration layer, or real-time stream fan-out is introduced yet.
+Anything beyond this is out of scope.
 
 ---
 
