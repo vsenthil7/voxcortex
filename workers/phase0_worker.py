@@ -15,20 +15,13 @@ from services.cortexreasoner.gemini_reasoner import explain
 log = logging.getLogger("phase0_worker")
 
 
-def _jsonb(v) -> str:
-    return json.dumps(v, ensure_ascii=False)
-
-
 def handle_canonical_event(event: dict) -> None:
     """
     Phase-0 Canonical Pipeline (STABLE)
 
-    1. Evidence snapshot (Step-7 replay-immune)
-    2. Deterministic belief update
-    3. Belief upsert (WITH evidence_ids)
-    4. Belief delta insert
-    5. Explanation insert
-    6. Audit log append
+    Phase-1C additions:
+    - Pass real belief_id into Gemini reasoner
+    - Persist AI explanation alongside canonical belief
     """
 
     trace_id = event.get("trace_id", "trc_demo")
@@ -65,7 +58,7 @@ def handle_canonical_event(event: dict) -> None:
 
     with engine.begin() as conn:
 
-        # ---------- Belief UPSERT (FIXED) ----------
+        # ---------- Belief UPSERT ----------
         conn.execute(
             text("""
                 INSERT INTO beliefs (
@@ -103,7 +96,7 @@ def handle_canonical_event(event: dict) -> None:
             },
         )
 
-        # ---------- Belief Delta (Idempotent) ----------
+        # ---------- Belief Delta ----------
         conn.execute(
             text("""
                 INSERT INTO belief_deltas (
@@ -133,20 +126,18 @@ def handle_canonical_event(event: dict) -> None:
                 "created_at": now,
             },
         )
-        # 3) Explanation (Phase-0 canon: trace_id + payload only)
-        explanation_payload = {
-            "belief_id": belief.belief_id,
-            "subject": subject,
-            "hypothesis": hypothesis,
-            "confidence": float(belief.confidence),
-            "evidence_ids": [evidence_id],
-        }
 
+        # ---------- Phase-1 Explanation (AI, READ-ONLY) ----------
         explanation = explain(
             trace_id,
-            explanation_payload,
+            belief_id=belief.belief_id,   # ✅ FIXED
+            belief=belief,
+            evidence={
+                "evidence_id": evidence_id,
+                "sha256": evidence_sha,
+                "signature": signature,
+            },
         )
-
 
         conn.execute(
             text("""
@@ -208,7 +199,7 @@ def handle_canonical_event(event: dict) -> None:
             },
         )
 
-    log.info("Phase-0 pipeline completed")
+    log.info("Phase-0 + Phase-1C pipeline completed")
 
 
 def main() -> None:
