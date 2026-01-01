@@ -9,7 +9,7 @@ class Settings:
     pubsub_subscription_phase0: str = os.getenv("PUBSUB_SUB_PHASE0", "voxcortex-phase0-sub")
 
     # Database
-    database_url: str = "postgresql+psycopg://postgres:Future2026@localhost:5432/voxcortex"
+    database_url: str = "postgresql+psycopg://postgres:<<Password>>@localhost:5432/voxcortex"
 
 
     # AI providers (keys injected via Secret Manager -> env)
