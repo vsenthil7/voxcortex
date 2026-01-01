@@ -3,23 +3,47 @@
 import os
 import json
 import re
-
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 
 MODEL_PRIMARY = os.getenv(
     "GEMINI_REASONER_MODEL",
-    "models/gemini-2.5-pro"
+    "models/gemini-2.5-flash"
 )
 
 _client = genai.Client(
-    api_key=os.environ["GOOGLE_API_KEY"]
+    api_key=os.environ.get("GOOGLE_API_KEY")
 )
+
+
+def _safe_json_parse(text: str) -> dict:
+    """
+    Hardened JSON parser:
+    - strips markdown fences
+    - extracts first JSON object only
+    - fails loudly if invalid
+    """
+    if not text:
+        raise ValueError("Empty response from Gemini")
+
+    # Remove ```json fences if present
+    text = re.sub(r"```json|```", "", text).strip()
+
+    start = text.find("{")
+    end = text.rfind("}") + 1
+
+    if start == -1 or end <= start:
+        raise ValueError(f"No JSON object found in:\n{text}")
+
+    return json.loads(text[start:end])
+
 
 def explain(belief: dict, evidence: list[dict]) -> dict:
     """
     Produce a bounded, evidence-grounded explanation.
     STRICT JSON only.
+    NEVER breaks the pipeline.
     """
 
     prompt = f"""
@@ -43,33 +67,36 @@ Evidence:
 {json.dumps(evidence, indent=2)}
 """.strip()
 
-    response = _client.models.generate_content(
-        model=MODEL_PRIMARY,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[types.Part(text=prompt)]
-            )
-        ]
-    )
-
-
-    text = response.text.strip()
-    
-    # Strip fenced code blocks: ```json ... ```
-    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"```$", "", text).strip()
-    
-    # Extract first JSON object if extra text exists
-    if not text.startswith("{"):
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            raise RuntimeError(f"No JSON object found in Gemini output:\n{text}")
-        text = match.group(0)
-    
     try:
-        return json.loads(text)
+        response = _client.models.generate_content(
+            model=MODEL_PRIMARY,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=prompt)]
+                )
+            ],
+        )
+        return _safe_json_parse(response.text)
+
+    except ClientError as e:
+        # RATE LIMIT / QUOTA SAFE DEGRADE
+        if getattr(e, "status_code", None) == 429:
+            return {
+                "explanation": "Explanation deferred due to Gemini rate limits.",
+                "confidence_language": {
+                    "tone": "unknown",
+                    "markers": ["rate_limited", "deferred"]
+                },
+                "evidence_ids": [],
+                "why_not": ["Gemini API quota exhausted"],
+                "what_would_change_my_mind": [
+                    "Retry after Gemini quota reset"
+                ],
+            }
+        raise
+
     except Exception as e:
         raise RuntimeError(
-            f"Gemini returned unparseable JSON:\n{text}"
+            f"Gemini returned invalid output:\n{str(e)}"
         ) from e

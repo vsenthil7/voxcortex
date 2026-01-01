@@ -1,14 +1,56 @@
-import json
 from datetime import datetime, timezone
+import uuid
 
-from services.beliefcore.models import Belief, BeliefDelta, EvidenceRef
-from services.shared.ids import new_id
-from services.shared.db import exec_sql
+# =========================================
+# Internal deterministic update (PRIVATE)
+# =========================================
+
+def _deterministic_update(
+    subject,
+    trace_id,
+    hypothesis,
+    prior,
+    signal_strength,
+    evidence_id,
+):
+    """
+    INTERNAL FUNCTION — positional args ONLY
+    """
+
+    belief_id = f"blf_{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+
+    # Deterministic confidence update
+    to_conf = round(
+        min(1.0, max(0.0, prior + (signal_strength * (1 - prior)))),
+        3
+    )
+
+    belief = Belief(
+        belief_id=belief_id,
+        trace_id=trace_id,
+        subject=subject,
+        hypothesis=hypothesis,
+        confidence=to_conf,
+        updated_at=now,
+        evidence=[EvidenceRef(evidence_id=evidence_id)],
+    )
+
+    delta = BeliefDelta(
+        belief_id=belief_id,
+        trace_id=trace_id,
+        from_conf=prior,
+        to_conf=to_conf,
+        reason=f"deterministic_update(prior={prior}, signal={signal_strength})",
+        created_at=now,
+    )
+
+    return belief, delta
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
+# =========================================
+# PUBLIC CANONICAL API
+# =========================================
 
 def deterministic_update(
     subject: str,
@@ -17,84 +59,86 @@ def deterministic_update(
     prior: float,
     signal_strength: float,
     evidence_id: str,
-) -> tuple[Belief, BeliefDelta]:
+):
     """
-    Phase 0 deterministic belief update.
-    No AI. No heuristics. Fully reproducible.
+    CANONICAL ENTRYPOINT — workers import ONLY this
     """
-    to_conf = max(0.0, min(1.0, prior + 0.35 * signal_strength))
-    belief_id = new_id("blf")
-    updated_at = now_iso()
-
-    belief = Belief(
-        belief_id=belief_id,
-        trace_id=trace_id,
-        subject=subject,
-        hypothesis=hypothesis,
-        confidence=to_conf,
-        evidence=[
-            EvidenceRef(
-                evidence_id=evidence_id,
-                kind="event",
-                pointer={"event_id": evidence_id},
-            )
-        ],
-        updated_at=updated_at,
+    return _deterministic_update(
+        subject,
+        trace_id,
+        hypothesis,
+        prior,
+        signal_strength,
+        evidence_id,
     )
 
-    delta = BeliefDelta(
-        belief_id=belief_id,
-        from_conf=prior,
-        to_conf=to_conf,
-        reason=f"deterministic_update(prior={prior}, signal={signal_strength})",
-    )
 
-    # ✅ CANONICAL SQL — NO ::jsonb, NO %(), NO $1
-    exec_sql(
-        """
-        INSERT INTO beliefs(
-            belief_id, trace_id, subject, hypothesis,
-            confidence, updated_at, evidence_ids
-        )
-        VALUES (
-            :belief_id, :trace_id, :subject, :hypothesis,
-            :confidence, :updated_at, CAST(:evidence_ids AS jsonb)
-        )
-        """,
-        belief_id=belief_id,
-        trace_id=trace_id,
-        subject=subject,
-        hypothesis=hypothesis,
-        confidence=to_conf,
-        updated_at=updated_at,
-        evidence_ids=json.dumps([e.evidence_id for e in belief.evidence]),
-    )
+# =========================================
+# Domain Objects (Serializable)
+# =========================================
 
-    exec_sql(
-        """
-        INSERT INTO belief_deltas(
-            belief_id,
-            trace_id,
-            from_conf,
-            to_conf,
-            reason,
-            created_at
-        )
-        VALUES (
-            :belief_id,
-            :trace_id,
-            :from_conf,
-            :to_conf,
-            :reason,
-            :created_at
-        )
-        """,
-        belief_id=belief_id,
-        trace_id=trace_id,
-        from_conf=prior,
-        to_conf=to_conf,
-        reason=delta.reason,
-        created_at=updated_at,
-    )
+class EvidenceRef:
+    def __init__(self, evidence_id: str):
+        self.evidence_id = evidence_id
 
-    return belief, delta
+    def to_dict(self):
+        return {"evidence_id": self.evidence_id}
+
+
+class Belief:
+    def __init__(
+        self,
+        belief_id,
+        trace_id,
+        subject,
+        hypothesis,
+        confidence,
+        updated_at,
+        evidence,
+    ):
+        self.belief_id = belief_id
+        self.trace_id = trace_id
+        self.subject = subject
+        self.hypothesis = hypothesis
+        self.confidence = confidence
+        self.updated_at = updated_at
+        self.evidence = evidence
+
+    def to_dict(self):
+        return {
+            "belief_id": self.belief_id,
+            "trace_id": self.trace_id,
+            "subject": self.subject,
+            "hypothesis": self.hypothesis,
+            "confidence": self.confidence,
+            "updated_at": self.updated_at.isoformat(),
+            "evidence": [e.to_dict() for e in self.evidence],
+        }
+
+
+class BeliefDelta:
+    def __init__(
+        self,
+        belief_id,
+        trace_id,
+        from_conf,
+        to_conf,
+        reason,
+        created_at,
+    ):
+        self.belief_id = belief_id
+        self.trace_id = trace_id
+        self.from_conf = from_conf
+        self.to_conf = to_conf
+        self.reason = reason
+        self.created_at = created_at
+
+    def to_dict(self):
+        return {
+            "belief_id": self.belief_id,
+            "trace_id": self.trace_id,
+            "from_conf": self.from_conf,
+            "to_conf": self.to_conf,
+            "reason": self.reason,
+            "created_at": self.created_at.isoformat(),
+        }
